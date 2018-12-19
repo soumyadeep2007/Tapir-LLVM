@@ -130,6 +130,38 @@ static void emitMissedWarning(Function *F, Loop *L,
   }
 }
 
+class SeqLoopSpawning : public LoopOutline {
+public:
+  TapirTarget* tapirTarget;
+  SeqLoopSpawning(Loop *OrigLoop,
+                  ScalarEvolution &SE,
+                  LoopInfo *LI, 
+                  DominatorTree *DT,
+                  AssumptionCache *AC,
+                  OptimizationRemarkEmitter &ORE, 
+                  TapirTarget* tapirTarget)
+      : LoopOutline(OrigLoop, SE, LI, DT, AC, ORE),
+        tapirTarget(tapirTarget) {}
+  bool processLoop();
+
+  virtual ~SeqLoopSpawning() {}
+
+  protected:
+  Value* computeGrainsize(Value *Limit);
+  void implementSeqIterSpawnOnHelper(Function *Helper,
+                                     BasicBlock *Preheader,
+                                     BasicBlock *Header,
+                                     PHINode *CanonicalIV,
+                                     Argument *Limit,
+                                     Argument *Grainsize,
+                                     Instruction *SyncRegion,
+                                     DominatorTree *DT,
+                                     LoopInfo *LI,
+                                     bool CanonicalIVFlagNUW = false,
+                                     bool CanonicalIVFlagNSW = false);
+  unsigned SpecifiedGrainsize;
+};
+
 /// DACLoopSpawning implements the transformation to spawn the iterations of a
 /// Tapir loop in a recursive divide-and-conquer fashion.
 class DACLoopSpawning : public LoopOutline {
@@ -331,6 +363,23 @@ void LoopOutline::unlinkLoop() {
   }
 }
 
+Value* SeqLoopSpawning::computeGrainsize(Value *Limit) {
+  Loop *L = OrigLoop;
+
+  Value *Grainsize;
+  BasicBlock *Preheader = L->getLoopPreheader();
+  assert(Preheader && "No Preheader found for loop.");
+
+  IRBuilder<> Builder(Preheader->getTerminator());
+  //setup workers
+  /*Value *Workers = Builder.CreateUDiv(tapirTarget->GetOrCreateWorker8(*Preheader->getParent(),
+      ConstantInt::get(Limit->getType(), 8)));
+  Workers = Builder.CreateIntCast(Workers, Limit->getType(), false);*/
+  //grain size for parallel-region defined artificial loops is 1.
+  Grainsize = ConstantInt::get(Limit->getType(), 1);
+  return Grainsize;
+}
+
 /// \brief Compute the grainsize of the loop, based on the limit.
 ///
 /// The grainsize is computed by the following equation:
@@ -364,6 +413,151 @@ Value* DACLoopSpawning::computeGrainsize(Value *Limit) {
   Grainsize = Builder.CreateSelect(Cmp, LargeLoopVal, SmallLoopVal);
 
   return Grainsize;
+}
+
+void SeqLoopSpawning::implementSeqIterSpawnOnHelper(Function *Helper,
+                                                    BasicBlock *Preheader,
+                                                    BasicBlock *Header,
+                                                    PHINode *CanonicalIV,
+                                                    Argument *Limit,
+                                                    Argument *Grainsize,
+                                                    Instruction *SyncRegion,
+                                                    DominatorTree *DT,
+                                                    LoopInfo *LI,
+                                                    bool CanonicalIVFlagNUW,
+                                                    bool CanonicalIVFlagNSW) {
+  // Serialize the cloned copy of the loop.
+  assert(Preheader->getParent() == Helper &&
+         "Preheader does not belong to helper function.");
+  assert(Header->getParent() == Helper &&
+         "Header does not belong to helper function.");
+  assert(CanonicalIV->getParent() == Header &&
+         "CanonicalIV does not belong to header");
+  assert(isa<DetachInst>(Header->getTerminator()) &&
+         "Cloned header is not terminated by a detach.");
+  DetachInst *DI = dyn_cast<DetachInst>(Header->getTerminator());
+  SerializeDetachedCFG(DI, DT);
+
+  // Convert the cloned loop into the strip-mined loop body.
+
+  BasicBlock *SeqHead = Preheader;
+  if (&(Helper->getEntryBlock()) == Preheader)
+    // Split the entry block.  We'll want to create a backedge into
+    // the split block later.
+    SeqHead = SplitBlock(Preheader, Preheader->getTerminator(), DT, LI);
+
+  BasicBlock *RecurHead, *RecurDet, *RecurCont;
+  Value *IterCount;
+  Value *CanonicalIVInput;
+  PHINode *CanonicalIVStart;
+  {
+    Instruction *PreheaderOrigFront = &(SeqHead->front());
+    IRBuilder<> Builder(PreheaderOrigFront);
+    // Create branch based on grainsize.
+    DEBUG(dbgs() << "LS CanonicalIV: " << *CanonicalIV << "\n");
+    CanonicalIVInput = CanonicalIV->getIncomingValueForBlock(SeqHead);
+    CanonicalIVStart = Builder.CreatePHI(CanonicalIV->getType(), 2,
+                                         CanonicalIV->getName()+".seq");
+    CanonicalIVInput->replaceAllUsesWith(CanonicalIVStart);
+    IterCount = Builder.CreateSub(Limit, CanonicalIVStart,
+                                  "itercount");
+    Value *IterCountCmp = Builder.CreateICmpUGT(IterCount, Grainsize);
+    TerminatorInst *RecurTerm =
+      SplitBlockAndInsertIfThen(IterCountCmp, PreheaderOrigFront,
+                                /*Unreachable=*/false,
+                                /*BranchWeights=*/nullptr,
+                                DT);
+    RecurHead = RecurTerm->getParent();
+    // Create skeleton of divide-and-conquer recursion:
+    // SeqHead -> RecurHead -> RecurDet -> RecurCont -> SeqHead
+    RecurDet = SplitBlock(RecurHead, RecurHead->getTerminator(),
+                          DT, LI);
+    RecurCont = SplitBlock(RecurDet, RecurDet->getTerminator(),
+                           DT, LI);
+    RecurCont->getTerminator()->replaceUsesOfWith(RecurTerm->getSuccessor(0),
+                                                  SeqHead);
+  }
+
+  // Compute mid iteration in RecurHead.
+  Value *MidIter, *MidIterPlusOne;
+  {
+    IRBuilder<> Builder(&(RecurHead->front()));
+    MidIter = Builder.CreateAdd(CanonicalIVStart,
+                                Builder.CreateLShr(IterCount, 1,
+                                                   "halfcount"),
+                                "miditer",
+                                CanonicalIVFlagNUW, CanonicalIVFlagNSW);
+  }
+
+  // Create recursive call in RecurDet.
+  {
+    // Create input array for recursive call.
+    IRBuilder<> Builder(&(RecurDet->front()));
+    SetVector<Value*> RecurInputs;
+    Function::arg_iterator AI = Helper->arg_begin();
+    // Handle an initial sret argument, if necessary.  Based on how
+    // the Helper function is created, any sret parameter will be the
+    // first parameter.
+    if (Helper->hasParamAttribute(0, Attribute::StructRet))
+      RecurInputs.insert(&*AI++);
+    assert(cast<Argument>(CanonicalIVInput) == &*AI &&
+           "First non-sret argument does not match original input to canonical IV.");
+    RecurInputs.insert(CanonicalIVStart);
+    ++AI;
+    assert(Limit == &*AI &&
+           "Second non-sret argument does not match original input to the loop limit.");
+    RecurInputs.insert(MidIter);
+    ++AI;
+    for (Function::arg_iterator AE = Helper->arg_end();
+         AI != AE;  ++AI)
+        RecurInputs.insert(&*AI);
+    DEBUG({
+        dbgs() << "RecurInputs: ";
+        for (Value *Input : RecurInputs)
+          dbgs() << *Input << ", ";
+        dbgs() << "\n";
+      });
+
+    // Create call instruction.
+    CallInst *RecurCall = Builder.CreateCall(Helper, RecurInputs.getArrayRef());
+    RecurCall->setDebugLoc(Header->getTerminator()->getDebugLoc());
+    // Use a fast calling convention for the helper.
+    RecurCall->setCallingConv(CallingConv::Fast);
+    // RecurCall->setCallingConv(Helper->getCallingConv());
+    // // Update CG graph with the recursive call we just added.
+    // CG[Helper]->addCalledFunction(RecurCall, CG[Helper]);
+  }
+
+  // Set up continuation of detached recursive call.  We effectively
+  // inline this tail call automatically.
+  {
+    IRBuilder<> Builder(&(RecurCont->front()));
+    MidIterPlusOne = Builder.CreateAdd(MidIter,
+                                       ConstantInt::get(Limit->getType(), 1),
+                                       "miditerplusone",
+                                       CanonicalIVFlagNUW,
+                                       CanonicalIVFlagNSW);
+  }
+
+  // Finish setup of new phi node for canonical IV.
+  {
+    CanonicalIVStart->addIncoming(CanonicalIVInput, Preheader);
+    CanonicalIVStart->addIncoming(MidIterPlusOne, RecurCont);
+  }
+
+  /// Make the recursive DAC parallel.
+  {
+    IRBuilder<> Builder(RecurHead->getTerminator());
+    // Create the detach.
+    DetachInst *DI = Builder.CreateDetach(RecurDet, RecurCont, SyncRegion);
+    DI->setDebugLoc(Header->getTerminator()->getDebugLoc());
+    RecurHead->getTerminator()->eraseFromParent();
+    // Create the reattach.
+    Builder.SetInsertPoint(RecurDet->getTerminator());
+    ReattachInst *RI = Builder.CreateReattach(RecurCont, SyncRegion);
+    RI->setDebugLoc(Header->getTerminator()->getDebugLoc());
+    RecurDet->getTerminator()->eraseFromParent();
+  }
 }
 
 /// \brief Method to help convertLoopToDACIterSpawn convert the Tapir
@@ -427,22 +621,22 @@ void DACLoopSpawning::implementDACIterSpawnOnHelper(Function *Helper,
 
   // Convert the cloned loop into the strip-mined loop body.
 
-  BasicBlock *DACHead = Preheader;
+  BasicBlock *SeqHead = Preheader;
   if (&(Helper->getEntryBlock()) == Preheader)
     // Split the entry block.  We'll want to create a backedge into
     // the split block later.
-    DACHead = SplitBlock(Preheader, Preheader->getTerminator(), DT, LI);
+    SeqHead = SplitBlock(Preheader, Preheader->getTerminator(), DT, LI);
 
   BasicBlock *RecurHead, *RecurDet, *RecurCont;
   Value *IterCount;
   Value *CanonicalIVInput;
   PHINode *CanonicalIVStart;
   {
-    Instruction *PreheaderOrigFront = &(DACHead->front());
+    Instruction *PreheaderOrigFront = &(SeqHead->front());
     IRBuilder<> Builder(PreheaderOrigFront);
     // Create branch based on grainsize.
     DEBUG(dbgs() << "LS CanonicalIV: " << *CanonicalIV << "\n");
-    CanonicalIVInput = CanonicalIV->getIncomingValueForBlock(DACHead);
+    CanonicalIVInput = CanonicalIV->getIncomingValueForBlock(SeqHead);
     CanonicalIVStart = Builder.CreatePHI(CanonicalIV->getType(), 2,
                                          CanonicalIV->getName()+".dac");
     CanonicalIVInput->replaceAllUsesWith(CanonicalIVStart);
@@ -456,13 +650,13 @@ void DACLoopSpawning::implementDACIterSpawnOnHelper(Function *Helper,
                                 DT);
     RecurHead = RecurTerm->getParent();
     // Create skeleton of divide-and-conquer recursion:
-    // DACHead -> RecurHead -> RecurDet -> RecurCont -> DACHead
+    // SeqHead -> RecurHead -> RecurDet -> RecurCont -> SeqHead
     RecurDet = SplitBlock(RecurHead, RecurHead->getTerminator(),
                           DT, LI);
     RecurCont = SplitBlock(RecurDet, RecurDet->getTerminator(),
                            DT, LI);
     RecurCont->getTerminator()->replaceUsesOfWith(RecurTerm->getSuccessor(0),
-                                                  DACHead);
+                                                  SeqHead);
   }
 
   // Compute mid iteration in RecurHead.
@@ -605,6 +799,647 @@ static Type *getWiderType(const DataLayout &DL, Type *Ty0, Type *Ty1) {
   return Ty1;
 }
 
+bool SeqLoopSpawning::processLoop() {
+  if (!tapirTarget) {
+    return false;
+  }
+
+  Loop *L = OrigLoop;
+
+  BasicBlock *Header = L->getHeader();
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Latch = L->getLoopLatch();
+
+  DEBUG({
+      LoopBlocksDFS DFS(L);
+      DFS.perform(LI);
+      dbgs() << "Blocks in loop (from DFS):\n";
+      for (BasicBlock *BB : make_range(DFS.beginRPO(), DFS.endRPO()))
+        dbgs() << *BB;
+    });
+
+  using namespace ore;
+
+  // Check that this loop has a valid exit block after the latch.
+  if (!ExitBlock) {
+    DEBUG(dbgs() << "LS loop does not contain valid exit block after latch.\n");
+    ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "InvalidLatchExit",
+                                        L->getStartLoc(),
+                                        Header)
+             << "invalid latch exit");
+    return false;
+  }
+
+  // Get special exits from this loop.
+  SmallVector<BasicBlock *, 4> EHExits;
+  getEHExits(L, ExitBlock, EHExits);
+
+  // Check the exit blocks of the loop.
+  SmallVector<BasicBlock *, 4> ExitBlocks;
+  L->getExitBlocks(ExitBlocks);
+
+  for (const BasicBlock *Exit : ExitBlocks) {
+    if (Exit == ExitBlock) continue;
+    if (Exit->isLandingPad()) {
+      DEBUG({
+          const LandingPadInst *LPI = Exit->getLandingPadInst();
+          dbgs() << "landing pad found: " << *LPI << "\n";
+          for (const User *U : LPI->users())
+            dbgs() << "\tuser " << *U << "\n";
+        });
+    }
+  }
+  SmallPtrSet<BasicBlock *, 4> HandledExits;
+  for (BasicBlock *BB : EHExits)
+    HandledExits.insert(BB);
+  for (BasicBlock *Exit : ExitBlocks) {
+    if (Exit == ExitBlock) continue;
+    if (!HandledExits.count(Exit)) {
+      DEBUG(dbgs() << "LS loop contains a bad exit block " << *Exit);
+      ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "BadExit",
+                                          L->getStartLoc(),
+                                          Header)
+               << "bad exit block found");
+      return false;
+    }
+  }
+
+  Function *F = Header->getParent();
+  Module* M = F->getParent();
+
+  DEBUG(dbgs() << "LS loop header:" << *Header);
+  DEBUG(dbgs() << "LS loop latch:" << *Latch);
+  DEBUG(dbgs() << "LS SE exit count: " << *(SE.getExitCount(L, Latch)) << "\n");
+
+  Value *Workers = Builder.CreateUDiv(tapirTarget->GetOrCreateWorker8(*Preheader->getParent(),
+      ConstantInt::get(Limit->getType(), 8)));
+  Workers = Builder.CreateIntCast(Workers, Limit->getType(), false);
+  const SCEV *Limit = Workers;
+  DEBUG(dbgs() << "LS Loop limit: " << *Limit << "\n");
+
+  Type *CanonicalIVTy = Limit->getType();
+  {
+    const DataLayout &DL = M->getDataLayout();
+    for (BasicBlock::iterator II = Header->begin(); isa<PHINode>(II); ++II) {
+      PHINode *PN = cast<PHINode>(II);
+      if (PN->getType()->isFloatingPointTy()) continue;
+      CanonicalIVTy = getWiderType(DL, PN->getType(), CanonicalIVTy);
+    }
+    Limit = SE.getNoopOrAnyExtend(Limit, CanonicalIVTy);
+  }
+
+  /// Clean up the loop's induction variables.
+  PHINode *CanonicalIV = canonicalizeIVs(CanonicalIVTy);
+  if (!CanonicalIV) {
+    DEBUG(dbgs() << "Could not get canonical IV.\n");
+    // emitAnalysis(LoopSpawningReport()
+    //              << "Could not get a canonical IV.\n");
+    ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "NoCanonicalIV",
+                                        L->getStartLoc(),
+                                        Header)
+             << "could not find or create canonical IV");
+    return false;
+  }
+  const SCEVAddRecExpr *CanonicalSCEV =
+    cast<const SCEVAddRecExpr>(SE.getSCEV(CanonicalIV));
+
+  // Remove all IV's other than CanonicalIV.
+  // First, check that we can do this.
+  bool CanRemoveIVs = true;
+  for (BasicBlock::iterator II = Header->begin(); isa<PHINode>(II); ++II) {
+    PHINode *PN = cast<PHINode>(II);
+    if (CanonicalIV == PN) continue;
+    // dbgs() << "IV " << *PN;
+    const SCEV *S = SE.getSCEV(PN);
+    // dbgs() << " SCEV " << *S << "\n";
+    if (SE.getCouldNotCompute() == S) {
+      // emitAnalysis(LoopSpawningReport(PN)
+      //              << "Could not compute the scalar evolution.\n");
+      ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "NoSCEV", PN)
+               << "could not compute scalar evolution of "
+               << NV("PHINode", PN));
+      CanRemoveIVs = false;
+    }
+  }
+
+  if (!CanRemoveIVs) {
+    DEBUG(dbgs() << "Could not compute scalar evolutions for all IV's.\n");
+    return false;
+  }
+
+  SCEVExpander Exp(SE, M->getDataLayout(), "ls");
+
+  // Remove the IV's (other than CanonicalIV) and replace them with
+  // their stronger forms.
+  //
+  // TODO?: We can probably adapt this loop->DAC process such that we
+  // don't require all IV's to be canonical.
+  {
+    SmallVector<PHINode*, 8> IVsToRemove;
+    for (BasicBlock::iterator II = Header->begin(); isa<PHINode>(II); ++II) {
+      PHINode *PN = cast<PHINode>(II);
+      if (PN == CanonicalIV) continue;
+      const SCEV *S = SE.getSCEV(PN);
+      DEBUG(dbgs() << "Removing the IV " << *PN << " (" << *S << ")\n");
+      ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "RemoveIV", PN)
+               << "removing the IV "
+               << NV("PHINode", PN));
+      Value *NewIV = Exp.expandCodeFor(S, S->getType(), CanonicalIV);
+      PN->replaceAllUsesWith(NewIV);
+      IVsToRemove.push_back(PN);
+    }
+    for (PHINode *PN : IVsToRemove)
+      PN->eraseFromParent();
+  }
+
+  // All remaining IV's should be canonical.  Collect them.
+  //
+  // TODO?: We can probably adapt this loop->DAC process such that we
+  // don't require all IV's to be canonical.
+  SmallVector<PHINode*, 8> IVs;
+  bool AllCanonical = true;
+  for (BasicBlock::iterator II = Header->begin(); isa<PHINode>(II); ++II) {
+    PHINode *PN = cast<PHINode>(II);
+    DEBUG({
+        const SCEVAddRecExpr *PNSCEV =
+          dyn_cast<const SCEVAddRecExpr>(SE.getSCEV(PN));
+        assert(PNSCEV && "PHINode did not have corresponding SCEVAddRecExpr");
+        assert(PNSCEV->getStart()->isZero() &&
+               "PHINode SCEV does not start at 0");
+        dbgs() << "LS step recurrence for SCEV " << *PNSCEV << " is "
+               << *(PNSCEV->getStepRecurrence(SE)) << "\n";
+        assert(PNSCEV->getStepRecurrence(SE)->isOne() &&
+               "PHINode SCEV step is not 1");
+      });
+    if (ConstantInt *C =
+        dyn_cast<ConstantInt>(PN->getIncomingValueForBlock(Preheader))) {
+      if (C->isZero()) {
+        DEBUG({
+            if (PN != CanonicalIV) {
+              const SCEVAddRecExpr *PNSCEV =
+                dyn_cast<const SCEVAddRecExpr>(SE.getSCEV(PN));
+              dbgs() << "Saving the canonical IV " << *PN << " (" << *PNSCEV << ")\n";
+            }
+          });
+        if (PN != CanonicalIV)
+          ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "SaveIV", PN)
+                   << "saving the canonical the IV "
+                   << NV("PHINode", PN));
+        IVs.push_back(PN);
+      }
+    } else {
+      AllCanonical = false;
+      DEBUG(dbgs() << "Remaining non-canonical PHI Node found: " << *PN <<
+            "\n");
+      // emitAnalysis(LoopSpawningReport(PN)
+      //              << "Found a remaining non-canonical IV.\n");
+      ORE.emit(OptimizationRemarkAnalysis(DEBUG_TYPE, "NonCanonicalIV", PN)
+               << "found a remaining noncanonical IV");
+    }
+  }
+  if (!AllCanonical)
+    return false;
+
+  // Insert the computation for the loop limit into the Preheader.
+  Value *LimitVar = Exp.expandCodeFor(Limit, CanonicalIVTy,
+                                      Preheader->getTerminator());
+  DEBUG(dbgs() << "LimitVar: " << *LimitVar << "\n");
+
+  // Canonicalize the loop latch.
+  assert(SE.isLoopBackedgeGuardedByCond(L, ICmpInst::ICMP_ULT,
+                                        CanonicalSCEV, Limit) &&
+         "Loop backedge is not guarded by canonical comparison with limit.");
+  Value *NewCond = canonicalizeLoopLatch(CanonicalIV, LimitVar);
+
+  // Insert computation of grainsize into the Preheader.
+  // For debugging:
+  // Value *GrainVar = ConstantInt::get(Limit->getType(), 2);
+  Value *GrainVar;
+  if (!SpecifiedGrainsize)
+    GrainVar = computeGrainsize(LimitVar);
+  else
+    GrainVar = ConstantInt::get(LimitVar->getType(), SpecifiedGrainsize);
+
+  DEBUG(dbgs() << "GrainVar: " << *GrainVar << "\n");
+
+  SetVector<Value *> Inputs, Outputs;
+  SetVector<Value *> BodyInputs, BodyOutputs;
+  ValueToValueMapTy VMap, InputMap;
+  std::vector<BasicBlock *> LoopBlocks;
+  SmallPtrSet<BasicBlock *, 4> ExitsToSplit;
+  Value *SRetInput = nullptr;
+
+  // Get the sync region containing this Tapir loop.
+  const Instruction *InputSyncRegion;
+  {
+    const DetachInst *DI = cast<DetachInst>(Header->getTerminator());
+    InputSyncRegion = cast<Instruction>(DI->getSyncRegion());
+  }
+
+  {
+    LoopBlocks = L->getBlocks();
+    // // Add exit blocks terminated by unreachable.  There should not be any other
+    // // exit blocks in the loop.
+    // SmallSet<BasicBlock *, 4> UnreachableExits;
+    // for (BasicBlock *Exit : ExitBlocks) {
+    //   if (Exit == ExitBlock) continue;
+    //   assert(isa<UnreachableInst>(Exit->getTerminator()) &&
+    //          "Found problematic exit block.");
+    //   UnreachableExits.insert(Exit);
+    // }
+
+    // Add unreachable and exception-handling exits to the set of loop blocks to
+    // clone.
+    DEBUG({
+        dbgs() << "Handled exits of loop:";
+        for (BasicBlock *HE : HandledExits)
+          dbgs() << *HE;
+        dbgs() << "\n";
+      });
+    for (BasicBlock *HE : HandledExits)
+      LoopBlocks.push_back(HE);
+    {
+      const DetachInst *DI = cast<DetachInst>(Header->getTerminator());
+      BasicBlockEdge DetachEdge(Header, DI->getDetached());
+      for (BasicBlock *HE : HandledExits)
+        if (!DT || !DT->dominates(DetachEdge, HE))
+          ExitsToSplit.insert(HE);
+      DEBUG({
+          dbgs() << "Loop exits to split:";
+          for (BasicBlock *ETS : ExitsToSplit)
+            dbgs() << *ETS;
+          dbgs() << "\n";
+        });
+    }
+
+    // DEBUG({
+    //     dbgs() << "LoopBlocks: ";
+    //     for (BasicBlock *LB : LoopBlocks)
+    //       dbgs() << LB->getName() << "("
+    //              << *(LB->getTerminator()) << "), ";
+    //     dbgs() << "\n";
+    //   });
+
+    // Get the inputs and outputs for the loop body.
+    {
+      // CodeExtractor Ext(LoopBlocks, DT);
+      // Ext.findInputsOutputs(BodyInputs, BodyOutputs);
+      SmallPtrSet<BasicBlock *, 32> Blocks;
+      for (BasicBlock *BB : LoopBlocks)
+        Blocks.insert(BB);
+      findInputsOutputs(Blocks, BodyInputs, BodyOutputs, &ExitsToSplit);
+    }
+
+    // Scan for any sret parameters in BodyInputs and add them first.
+    if (F->hasStructRetAttr()) {
+      Function::arg_iterator ArgIter = F->arg_begin();
+      if (F->hasParamAttribute(0, Attribute::StructRet))
+  if (BodyInputs.count(&*ArgIter))
+    SRetInput = &*ArgIter;
+      if (F->hasParamAttribute(1, Attribute::StructRet)) {
+  ++ArgIter;
+  if (BodyInputs.count(&*ArgIter))
+    SRetInput = &*ArgIter;
+      }
+    }
+    if (SRetInput) {
+      DEBUG(dbgs() << "sret input " << *SRetInput << "\n");
+      Inputs.insert(SRetInput);
+    }
+
+    // Add argument for start of CanonicalIV.
+    DEBUG({
+        Value *CanonicalIVInput =
+          CanonicalIV->getIncomingValueForBlock(Preheader);
+        // CanonicalIVInput should be the constant 0.
+        assert(isa<Constant>(CanonicalIVInput) &&
+               "Input to canonical IV from preheader is not constant.");
+      });
+    Argument *StartArg = new Argument(CanonicalIV->getType(),
+                                      CanonicalIV->getName()+".start");
+    Inputs.insert(StartArg);
+    InputMap[CanonicalIV] = StartArg;
+
+    // Add argument for end.
+    //
+    // In the general case, the loop limit is the result of some computation
+    // that the pass added to the loop's preheader.  In this case, the variable
+    // storing the loop limit is used exactly once, in the canonicalized loop
+    // latch.  In this case, the pass wants to prevent outlining from passing
+    // the loop-limit variable as an arbitrary argument to the outlined
+    // function.  Hence, this pass adds the loop-limit variable as an argument
+    // manually.
+    //
+    // There are two special cases to consider: the loop limit is a constant, or
+    // the loop limit is used elsewhere within the loop.  To handle these two
+    // cases, this pass adds an explict argument for the end of the loop, to
+    // supports the subsequent transformation to using recursive
+    // divide-and-conquer.  After the loop is outlined, this pass will rewrite
+    // the latch in the outlined loop to use this explicit argument.
+    // Furthermore, this pass does not prevent outliner from recognizing the
+    // loop limit as a potential argument to the function.
+    if (isa<Constant>(LimitVar) || !LimitVar->hasOneUse()) {
+      Argument *EndArg = new Argument(LimitVar->getType(), "end");
+      Inputs.insert(EndArg);
+      InputMap[LimitVar] = EndArg;
+    } else {
+      // If the limit var is not constant and has exactly one use, then the
+      // limit var is the result of some nontrivial computation, and that one
+      // use is the new condition inserted.
+      Inputs.insert(LimitVar);
+      InputMap[LimitVar] = LimitVar;
+    }
+
+    // Add argument for grainsize.
+    if (isa<Constant>(GrainVar)) {
+      Argument *GrainArg = new Argument(GrainVar->getType(), "grainsize");
+      Inputs.insert(GrainArg);
+      InputMap[GrainVar] = GrainArg;
+    } else {
+      Inputs.insert(GrainVar);
+      InputMap[GrainVar] = GrainVar;
+    }
+
+    // Put all of the inputs together, and clear redundant inputs from
+    // the set for the loop body.
+    SmallVector<Value *, 8> BodyInputsToRemove;
+    for (Value *V : BodyInputs)
+      if (V == InputSyncRegion)
+        BodyInputsToRemove.push_back(V);
+      else if (!Inputs.count(V))
+        Inputs.insert(V);
+      else
+        BodyInputsToRemove.push_back(V);
+    for (Value *V : BodyInputsToRemove)
+      BodyInputs.remove(V);
+    DEBUG({
+        for (Value *V : BodyInputs)
+          dbgs() << "Remaining body input: " << *V << "\n";
+      });
+    for (Value *V : BodyOutputs)
+      dbgs() << "EL output: " << *V << "\n";
+    assert(0 == BodyOutputs.size() &&
+           "All results from parallel loop should be passed by memory already.");
+  }
+  DEBUG({
+      for (Value *V : Inputs)
+        dbgs() << "EL input: " << *V << "\n";
+      for (Value *V : Outputs)
+        dbgs() << "EL output: " << *V << "\n";
+    });
+
+  // Clone the loop blocks into a new helper function.
+  Function *Helper;
+  {
+    SmallVector<ReturnInst *, 4> Returns;  // Ignore returns cloned.
+
+    // LowerDbgDeclare(*(Header->getParent()));
+
+    Helper = CreateHelper(Inputs, Outputs, LoopBlocks,
+                          Header, Preheader, ExitBlock,
+                          VMap, M,
+                          F->getSubprogram() != nullptr, Returns, ".ls",
+                          &ExitsToSplit, InputSyncRegion,
+                          nullptr, nullptr, nullptr);
+
+    assert(Returns.empty() && "Returns cloned when cloning loop.");
+
+    // Use a fast calling convention for the helper.
+    Helper->setCallingConv(CallingConv::Fast);
+    // Helper->setCallingConv(Header->getParent()->getCallingConv());
+  }
+
+  // Add a sync to the helper's return.
+  BasicBlock *HelperHeader = cast<BasicBlock>(VMap[Header]);
+  {
+    BasicBlock *HelperExit = cast<BasicBlock>(VMap[ExitBlock]);
+    assert(isa<ReturnInst>(HelperExit->getTerminator()));
+    BasicBlock *NewHelperExit = SplitBlock(HelperExit,
+                                           HelperExit->getTerminator(),
+                                           DT, LI);
+    IRBuilder<> Builder(&(HelperExit->front()));
+    SyncInst *NewSync = Builder.CreateSync(
+        NewHelperExit,
+        cast<Instruction>(VMap[InputSyncRegion]));
+    // Set debug info of new sync to match that of terminator of the header of
+    // the cloned loop.
+    NewSync->setDebugLoc(HelperHeader->getTerminator()->getDebugLoc());
+    HelperExit->getTerminator()->eraseFromParent();
+  }
+
+  BasicBlock *NewPreheader = cast<BasicBlock>(VMap[Preheader]);
+  PHINode *NewCanonicalIV = cast<PHINode>(VMap[CanonicalIV]);
+
+  // Rewrite the cloned IV's to start at the start iteration argument.
+  {
+    // Rewrite clone of canonical IV to start at the start iteration
+    // argument.
+    Argument *NewCanonicalIVStart = cast<Argument>(VMap[InputMap[CanonicalIV]]);
+    {
+      int NewPreheaderIdx = NewCanonicalIV->getBasicBlockIndex(NewPreheader);
+      assert(isa<Constant>(NewCanonicalIV->getIncomingValue(NewPreheaderIdx)) &&
+             "Cloned canonical IV does not inherit a constant value from cloned preheader.");
+      NewCanonicalIV->setIncomingValue(NewPreheaderIdx, NewCanonicalIVStart);
+    }
+
+    // Rewrite other cloned IV's to start at their value at the start
+    // iteration.
+    const SCEV *StartIterSCEV = SE.getSCEV(NewCanonicalIVStart);
+    DEBUG(dbgs() << "StartIterSCEV: " << *StartIterSCEV << "\n");
+    for (PHINode *IV : IVs) {
+      if (CanonicalIV == IV) continue;
+
+      // Get the value of the IV at the start iteration.
+      DEBUG(dbgs() << "IV " << *IV);
+      const SCEV *IVSCEV = SE.getSCEV(IV);
+      DEBUG(dbgs() << " (SCEV " << *IVSCEV << ")");
+      const SCEVAddRecExpr *IVSCEVAddRec = cast<const SCEVAddRecExpr>(IVSCEV);
+      const SCEV *IVAtIter = IVSCEVAddRec->evaluateAtIteration(StartIterSCEV, SE);
+      DEBUG(dbgs() << " expands at iter " << *StartIterSCEV <<
+            " to " << *IVAtIter << "\n");
+
+      // NOTE: Expanded code should not refer to other IV's.
+      Value *IVStart = Exp.expandCodeFor(IVAtIter, IVAtIter->getType(),
+                                         NewPreheader->getTerminator());
+
+
+      // Set the value that the cloned IV inherits from the cloned preheader.
+      PHINode *NewIV = cast<PHINode>(VMap[IV]);
+      int NewPreheaderIdx = NewIV->getBasicBlockIndex(NewPreheader);
+      assert(isa<Constant>(NewIV->getIncomingValue(NewPreheaderIdx)) &&
+             "Cloned IV does not inherit a constant value from cloned preheader.");
+      NewIV->setIncomingValue(NewPreheaderIdx, IVStart);
+    }
+
+    // Remap the newly added instructions in the new preheader to use
+    // values local to the helper.
+    for (Instruction &II : *NewPreheader)
+      RemapInstruction(&II, VMap, RF_IgnoreMissingLocals,
+                       /*TypeMapper=*/nullptr, /*Materializer=*/nullptr);
+  }
+
+  // The loop has been outlined by this point.  To handle the special cases
+  // where the loop limit was constant or used elsewhere within the loop, this
+  // pass rewrites the outlined loop-latch condition to use the explicit
+  // end-iteration argument.
+  if (isa<Constant>(LimitVar) || !LimitVar->hasOneUse()) {
+    CmpInst *HelperCond = cast<CmpInst>(VMap[NewCond]);
+    assert(((isa<Constant>(LimitVar) &&
+             HelperCond->getOperand(1) == LimitVar) ||
+            (!LimitVar->hasOneUse() &&
+             HelperCond->getOperand(1) == VMap[LimitVar])) &&
+           "Unexpected condition in loop latch.");
+    IRBuilder<> Builder(HelperCond);
+    Value *NewHelperCond = Builder.CreateICmpULT(HelperCond->getOperand(0),
+                                                 VMap[InputMap[LimitVar]]);
+    HelperCond->replaceAllUsesWith(NewHelperCond);
+    HelperCond->eraseFromParent();
+    DEBUG(dbgs() << "Rewritten Latch: " <<
+          *(cast<Instruction>(NewHelperCond)->getParent()));
+  }
+
+  implementSeqIterSpawnOnHelper(Helper, NewPreheader,
+                                cast<BasicBlock>(VMap[Header]),
+                                cast<PHINode>(VMap[CanonicalIV]),
+                                cast<Argument>(VMap[InputMap[LimitVar]]),
+                                cast<Argument>(VMap[InputMap[GrainVar]]),
+                                cast<Instruction>(VMap[InputSyncRegion]),
+                                /*DT=*/nullptr, /*LI=*/nullptr,
+                                CanonicalSCEV->getNoWrapFlags(SCEV::FlagNUW),
+                                CanonicalSCEV->getNoWrapFlags(SCEV::FlagNSW));
+
+  if (verifyFunction(*Helper, &dbgs()))
+    return false;
+
+  // Update allocas in cloned loop body.
+  {
+    // Collect reattach instructions.
+    SmallVector<Instruction *, 4> ReattachPoints;
+    for (pred_iterator PI = pred_begin(Latch), PE = pred_end(Latch);
+         PI != PE; ++PI) {
+      BasicBlock *Pred = *PI;
+      if (!isa<ReattachInst>(Pred->getTerminator())) continue;
+      if (L->contains(Pred))
+        ReattachPoints.push_back(cast<BasicBlock>(VMap[Pred])->getTerminator());
+    }
+    // The cloned loop should be serialized by this point.
+    BasicBlock *ClonedLoopBodyEntry =
+      cast<BasicBlock>(VMap[Header])->getSingleSuccessor();
+    assert(ClonedLoopBodyEntry &&
+           "Head of cloned loop body has multiple successors.");
+    bool ContainsDynamicAllocas =
+      MoveStaticAllocasInBlock(&Helper->getEntryBlock(), ClonedLoopBodyEntry,
+                               ReattachPoints);
+
+    // If the cloned loop contained dynamic alloca instructions, wrap the cloned
+    // loop with llvm.stacksave/llvm.stackrestore intrinsics.
+    if (ContainsDynamicAllocas) {
+      Module *M = Helper->getParent();
+      // Get the two intrinsics we care about.
+      Function *StackSave = Intrinsic::getDeclaration(M, Intrinsic::stacksave);
+      Function *StackRestore =
+        Intrinsic::getDeclaration(M,Intrinsic::stackrestore);
+
+      // Insert the llvm.stacksave.
+      CallInst *SavedPtr = IRBuilder<>(&*ClonedLoopBodyEntry,
+                                       ClonedLoopBodyEntry->begin())
+                             .CreateCall(StackSave, {}, "savedstack");
+
+      // Insert a call to llvm.stackrestore before the reattaches in the
+      // original Tapir loop.
+      for (Instruction *ExitPoint : ReattachPoints)
+        IRBuilder<>(ExitPoint).CreateCall(StackRestore, SavedPtr);
+    }
+  }
+
+  if (verifyFunction(*Helper, &dbgs()))
+    return false;
+
+  // Add alignment assumptions to arguments of helper, based on alignment of
+  // values in old function.
+  AddAlignmentAssumptions(F, Inputs, VMap,
+                          Preheader->getTerminator(), AC, DT);
+
+  // Add call to new helper function in original function.
+  {
+    // Setup arguments for call.
+    SmallVector<Value *, 4> TopCallArgs;
+    // Add sret input, if it exists.
+    if (SRetInput)
+      TopCallArgs.push_back(SRetInput);
+    // Add start iteration 0.
+    assert(CanonicalSCEV->getStart()->isZero() &&
+           "Canonical IV does not start at zero.");
+    TopCallArgs.push_back(ConstantInt::get(CanonicalIV->getType(), 0));
+    // Add loop limit.
+    TopCallArgs.push_back(LimitVar);
+    // Add grainsize.
+    TopCallArgs.push_back(GrainVar);
+    // Add the rest of the arguments.
+    for (Value *V : BodyInputs)
+      TopCallArgs.push_back(V);
+    DEBUG({
+        for (Value *TCArg : TopCallArgs)
+          dbgs() << "Top call arg: " << *TCArg << "\n";
+      });
+
+    // Create call instruction.
+    IRBuilder<> Builder(Preheader->getTerminator());
+    CallInst *TopCall = Builder.CreateCall(Helper,
+                                           ArrayRef<Value *>(TopCallArgs));
+
+    // Use a fast calling convention for the helper.
+    TopCall->setCallingConv(CallingConv::Fast);
+    // TopCall->setCallingConv(Helper->getCallingConv());
+    TopCall->setDebugLoc(Header->getTerminator()->getDebugLoc());
+    // // Update CG graph with the call we just added.
+    // CG[F]->addCalledFunction(TopCall, CG[Helper]);
+  }
+
+  // Remove sync of loop in parent.
+  {
+    // Get the sync region for this loop's detached iterations.
+    DetachInst *HeadDetach = cast<DetachInst>(Header->getTerminator());
+    Value *SyncRegion = HeadDetach->getSyncRegion();
+    // Check the Tapir instructions contained in this sync region.  Look for a
+    // single sync instruction among those Tapir instructions.  Meanwhile,
+    // verify that the only detach instruction in this sync region is the detach
+    // in theloop header.  If these conditions are met, then we assume that the
+    // sync applies to this loop.  Otherwise, something more complicated is
+    // going on, and we give up.
+    SyncInst *LoopSync = nullptr;
+    bool SingleSyncJustForLoop = true;
+    for (User *U : SyncRegion->users()) {
+      // Skip the detach in the loop header.
+      if (HeadDetach == U) continue;
+      // Remember the first sync instruction we find.  If we find multiple sync
+      // instructions, then something nontrivial is going on.
+      if (SyncInst *SI = dyn_cast<SyncInst>(U)) {
+        if (!LoopSync)
+          LoopSync = SI;
+        else
+          SingleSyncJustForLoop = false;
+      }
+      // If we find a detach instruction that is not the loop header's, then
+      // something nontrivial is going on.
+      if (isa<DetachInst>(U))
+        SingleSyncJustForLoop = false;
+    }
+    if (LoopSync && SingleSyncJustForLoop)
+      // Replace the sync with a branch.
+      ReplaceInstWithInst(LoopSync,
+                          BranchInst::Create(LoopSync->getSuccessor(0)));
+    else if (!LoopSync)
+      DEBUG(dbgs() << "No sync found for this loop.");
+    else
+      DEBUG(dbgs() << "No single sync found that only affects this loop.");
+  }
+
+  unlinkLoop();
+
+  return Helper;
+}
+
 /// Top-level call to convert loop to spawn its iterations in a
 /// divide-and-conquer fashion.
 bool DACLoopSpawning::processLoop() {
@@ -680,7 +1515,12 @@ bool DACLoopSpawning::processLoop() {
   DEBUG(dbgs() << "LS SE exit count: " << *(SE.getExitCount(L, Latch)) << "\n");
 
   /// Get loop limit.
-  const SCEV *Limit = SE.getExitCount(L, Latch);
+  Value *Workers = Builder.CreateUDiv(tapirTarget->GetOrCreateWorker8(*Preheader->getParent(),
+      ConstantInt::get(Limit->getType(), 8)));
+  Workers = Builder.CreateIntCast(Workers, Limit->getType(), false);
+  const SCEV *Limit = Workers;
+
+  //const SCEV *Limit = SE.getExitCount(L, Latch);
   DEBUG(dbgs() << "LS Loop limit: " << *Limit << "\n");
   // PredicatedScalarEvolution PSE(SE, *L);
   // const SCEV *PLimit = PSE.getExitCount(L, Latch);
@@ -1414,6 +2254,30 @@ bool LoopSpawningImpl::processLoop(Loop *L) {
   switch(Hints.getStrategy()) {
   case LoopSpawningHints::ST_SEQ:
     DEBUG(dbgs() << "LS: Hints dictate sequential spawning.\n");
+    {
+      DebugLoc DLoc = L->getStartLoc();
+      BasicBlock *Header = L->getHeader();
+      SeqLoopSpawning SLS(L, SE, &LI, &DT, &AC, ORE, tapirTarget);
+      if (DLS.processLoop()) {
+        DEBUG({
+            if (verifyFunction(*L->getHeader()->getParent())) {
+              dbgs() << "Transformed function is invalid.\n";
+              return false;
+            }
+          });
+        // Report success.
+        ORE.emit(OptimizationRemark(LS_NAME, "SeqSpawning", DLoc, Header)
+                 << "spawning iterations sequentially");
+        return true;
+      } else {
+        // Report failure.
+        ORE.emit(OptimizationRemarkMissed(LS_NAME, "NoSeqSpawning", DLoc,
+                                          Header)
+                 << "cannot spawn iterations using divide-and-conquer");
+        emitMissedWarning(F, L, Hints, &ORE);
+        return false;
+      }
+    }
     break;
   case LoopSpawningHints::ST_DAC:
     DEBUG(dbgs() << "LS: Hints dictate DAC spawning.\n");
